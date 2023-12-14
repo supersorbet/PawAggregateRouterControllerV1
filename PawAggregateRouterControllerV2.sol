@@ -1,50 +1,34 @@
 // SPDX-License-Identifier: FrenswareV2BootlegDVD
-pragma solidity =0.8.16;
 
-import "./Ownable.sol";
-import "./IERC20.sol";
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./SafeERC20.sol";
+import "./IUniswapV2Router02.sol";
+import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 
-import "./IUniswapV2Router01.sol";
-
-contract PawAggregateRouterControllerV1 is Ownable {
+contract PawAggregateRouterControllerV2 is Ownable, IUniswapV3SwapCallback {
+    ISwapRouter public uniswapV3Router;
+    IUniswapV2Router01 public uniswapV2Router;
     using SafeERC20 for IERC20;
-    /***************
-     ** Variables ** !!!!!!!!!!!!!!!!!!!!!!
-     ***************/
+
     address public feeReceiver;
-    uint16 public feeBP = 25; // = 0.25 % 
-
-       // Team fees will be used to fund future developments of useful tools,
-               // similar to this one but with additions such as one block of high no collateral borrowing,
-                   // and being able to "line up" your trade route and execute arbitrage in one block (flash loans with no coding).
-                       // as well as being able to automate a path of actions in a single transaction, not in several transactions
-                              // ( ( so many different things could be done))
-                                                                                         
-    /***************
-     ** Constants **
-     ***************/
-    /**
-     * @dev BP (not blood pressure) = Percent * 100
-     * @notice BP has to be <= FEE_DENOMINATOR
-     * BP = FEE_DENOMINATOR -> 100 %
-     */
+    uint16 public feeDefault = 25; // 0.25 % swap fee
     uint16 public constant FEE_DENOMINATOR = 10000;
-    uint16 public constant MAX_FEE_BP = 100; // = 1 %
+    uint16 public constant MAX_FEE_BP = 100; // 1 %
 
-    /*****************
-     ** Constructor **
-     *****************/
-
-    constructor(address feeReceiver_) {
+    constructor(
+        address feeReceiver_,
+        address _uniswapV3Router,
+        address _uniswapV2Router //(sushi)
+    ) {
         _setFeeReceiver(feeReceiver_);
+        uniswapV3Router = ISwapRouter(_uniswapV3Router);
+        uniswapV2Router = IUniswapV2Router01(_uniswapV2Router);
     }
 
-    /************
-     ** Events **
-     ************/
-
-    event FeeBPChange(uint16 indexed fromFeeBP, uint16 indexed toFeeBP); // fees can be updated in the future by proposals and community votes
+    event setSwapFee(uint16 indexed fromFeeBP, uint16 indexed toFeeBP); // fees can be updated in the future via proposals and community votes
     event FeeReceiverChange(
         address indexed fromFeeReceiver,
         address indexed toFeeReceiver
@@ -57,10 +41,6 @@ contract PawAggregateRouterControllerV1 is Ownable {
         uint256 feesPaid
     );
 
-    /****************
-     ** Structures **
-     ****************/
-
     struct SwapDesc {
         IUniswapV2Router01 router;
         uint256 amountIn;
@@ -71,48 +51,90 @@ contract PawAggregateRouterControllerV1 is Ownable {
         bool withFee;
     }
 
-    /***************
-     ** Modifiers **
-     ***************/
-
     modifier pathMinLength2(address[] memory _path) {
         _pathMinLength2(_path);
         _;
     }
 
-    /***********************
-     ** Ownable Functions **
-     ***********************/
-
     function setFeeReceiver(address _feeReceiver) external onlyOwner {
         _setFeeReceiver(_feeReceiver);
     }
 
-    function setFeeBP(uint16 _feeBP) external onlyOwner {
+    function setFeeBP(uint16 _feeDefault) external onlyOwner {
         require(
-            _feeBP <= FEE_DENOMINATOR,
-            "UniswapV2Router01Intermediary: feeBP > FEE_DENOMINATOR"
+            _feeDefault <= FEE_DENOMINATOR,
+            "UniswapV2Router01: fee _ FEE_DENOMINATOR"
         );
-        require(
-            _feeBP <= MAX_FEE_BP,
-            "UniswapV2Router01Intermediary: feeBP > MAX_FEE_BP"
-        );
+        require(_feeDefault <= MAX_FEE_BP, "UniswapV2Router01: fee _ MAX");
 
-        emit FeeBPChange(feeBP, _feeBP);
-
-        feeBP = _feeBP;
+        emit setSwapFee(feeDefault, _feeDefault);
+        feeDefault = _feeDefault;
     }
 
-    /************************
-     ** External Functions **
-     ************************/
+    function setUniswapV2Router(address _uniswapV2Router) external onlyOwner {
+        uniswapV2Router = IUniswapV2Router01(_uniswapV2Router);
+    }
 
-    function getFeeDetails(uint256 _amount)
+    function setUniswapV3Router(address _uniswapV3Router) external onlyOwner {
+        uniswapV3Router = ISwapRouter(_uniswapV3Router);
+    }
+
+    /////// settings over
+
+    function getFeeData(uint256 _amount)
         external
         view
         returns (uint256 _fee, uint256 _left)
     {
-        return _getFeeDetails(_amount);
+        return _getFeeData(_amount);
+    }
+
+    function swapExactInputSingle(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenIn,
+        address tokenOut,
+        uint24 fee
+    ) external {
+        (uint256 feeAmount, uint256 amountInAfterFee) = _getFeeData(amountIn);
+
+        //t ransfer tokens from the user to the contract
+        IERC20(tokenIn).transferFrom(
+            msg.sender,
+            address(this),
+            amountInAfterFee
+        );
+        IERC20(tokenIn).transferFrom(msg.sender, feeReceiver, feeAmount);
+        IERC20(tokenIn).approve(address(uniswapV3Router), amountInAfterFee);
+
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter
+            .ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                fee: fee,
+                recipient: msg.sender,
+                deadline: block.timestamp,
+                amountIn: amountInAfterFee,
+                amountOutMinimum: amountOutMin,
+                sqrtPriceLimitX96: 0
+            });
+
+        uniswapV3Router.exactInputSingle(params);
+    }
+
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external override {
+        (address token0, address token1) = abi.decode(data, (address, address));
+
+        if (amount0Delta > 0) {
+            IERC20(token0).transfer(msg.sender, uint256(amount0Delta));
+        }
+        if (amount1Delta > 0) {
+            IERC20(token1).transfer(msg.sender, uint256(amount1Delta));
+        }
     }
 
     function swapExactTokensForTokens(
@@ -245,31 +267,24 @@ contract PawAggregateRouterControllerV1 is Ownable {
             );
     }
 
-    /************************
-     ** Internal Functions **
-     ************************/
-
     function _setFeeReceiver(address _feeReceiver) internal {
-        /// @dev avoid misuse by checking for zero address
         require(_feeReceiver != address(0));
 
         emit FeeReceiverChange(feeReceiver, _feeReceiver);
-
         feeReceiver = _feeReceiver;
     }
 
-    function _getFeeDetails(uint256 _amount)
+    function _getFeeData(uint256 _amount)
         internal
         view
         returns (uint256 _fee, uint256 _left)
     {
-        _fee = (_amount * feeBP) / FEE_DENOMINATOR;
+        _fee = (_amount * feeDefault) / FEE_DENOMINATOR;
         _left = _amount - _fee;
     }
 
     function _pathMinLength2(address[] memory _path) internal pure {
-        /// @dev path always has min. 2 tokens
-        require(_path.length >= 2, "UniswapV2Router01Intermediary: path < 2");
+        require(_path.length >= 2, "UniswapV2Router: path < 2"); // more than 2 coming soon
     }
 
     function _swapExactTokensForTokens(SwapDesc memory swapDesc)
@@ -277,18 +292,18 @@ contract PawAggregateRouterControllerV1 is Ownable {
         pathMinLength2(swapDesc.path)
         returns (uint256[] memory amounts)
     {
-        /// @dev if `path[0]` is zero the tx will fail because of SafeERC20
+        // if `path[0]` is zero the tx will fail because of SafeERC20
         IERC20 _fromToken = IERC20(swapDesc.path[0]);
 
         if (swapDesc.withFee) {
-            (uint256 _fee, uint256 _left) = _getFeeDetails(swapDesc.amountIn);
+            (uint256 _fee, uint256 _left) = _getFeeData(swapDesc.amountIn);
 
-            /// @dev send tokens to this contract for swapping (minus fees)
+            // send tokens to this contract for swapping (minus fees)
             _fromToken.safeTransferFrom(_msgSender(), address(this), _left);
-            /// @dev send fees to fee receiver
+            // send fees to fee receiver
             _fromToken.safeTransferFrom(_msgSender(), feeReceiver, _fee);
 
-            /// @dev approve tx to router
+            // approve tx to router
             _fromToken.safeIncreaseAllowance(address(swapDesc.router), _left);
 
             emit Swap(
@@ -308,14 +323,14 @@ contract PawAggregateRouterControllerV1 is Ownable {
                     swapDesc.deadline
                 );
         }
-        /// @dev send tokens to this contract for swapping
+        // send tokens to this contract for swapping
         _fromToken.safeTransferFrom(
             _msgSender(),
             address(this),
             swapDesc.amountIn
         );
 
-        /// @dev approve tx to router
+        // approve tx to router
         _fromToken.safeIncreaseAllowance(
             address(swapDesc.router),
             swapDesc.amountIn
@@ -345,15 +360,9 @@ contract PawAggregateRouterControllerV1 is Ownable {
         returns (uint256[] memory amounts)
     {
         if (swapDesc.withFee) {
-            (uint256 _fee, uint256 _left) = _getFeeDetails(swapDesc.amountIn);
-
-            /// @dev send fees to fee receiver
+            (uint256 _fee, uint256 _left) = _getFeeData(swapDesc.amountIn);
             (bool sent, ) = feeReceiver.call{value: _fee}("");
-            /// @dev check if Ether have been sent
-            require(
-                sent,
-                "UniswapV2Router01Intermediary: Failed to send Ether"
-            );
+            require(sent, "UniswapV2Router: Failed to send Ether");
 
             emit Swap(
                 address(swapDesc.router),
@@ -394,18 +403,14 @@ contract PawAggregateRouterControllerV1 is Ownable {
         pathMinLength2(swapDesc.path)
         returns (uint256[] memory amounts)
     {
-        /// @dev if `path[0]` is zero the tx will fail because of SafeERC20
+        // if `path[0]` is zero the tx will fail because safeERC20
         IERC20 _fromToken = IERC20(swapDesc.path[0]);
 
         if (swapDesc.withFee) {
-            (uint256 _fee, uint256 _left) = _getFeeDetails(swapDesc.amountIn);
+            (uint256 _fee, uint256 _left) = _getFeeData(swapDesc.amountIn);
 
-            /// @dev send tokens to this contract for swapping (minus fees)
             _fromToken.safeTransferFrom(_msgSender(), address(this), _left);
-            /// @dev send fees to fee receiver
             _fromToken.safeTransferFrom(_msgSender(), feeReceiver, _fee);
-
-            /// @dev approve tx to router
             _fromToken.safeIncreaseAllowance(address(swapDesc.router), _left);
 
             emit Swap(
@@ -425,14 +430,12 @@ contract PawAggregateRouterControllerV1 is Ownable {
                     swapDesc.deadline
                 );
         }
-        /// @dev send tokens to this contract for swapping
         _fromToken.safeTransferFrom(
             _msgSender(),
             address(this),
             swapDesc.amountIn
         );
 
-        /// @dev approve tx to router
         _fromToken.safeIncreaseAllowance(
             address(swapDesc.router),
             swapDesc.amountIn
@@ -454,5 +457,51 @@ contract PawAggregateRouterControllerV1 is Ownable {
                 swapDesc.to,
                 swapDesc.deadline
             );
+    }
+
+    function swapTokensV2(
+        address[] calldata path,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address to,
+        uint256 deadline
+    ) external {
+        IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
+        IERC20(path[0]).approve(address(uniswapV2Router), amountIn);
+
+        uniswapV2Router.swapExactTokensForTokens(
+            amountIn,
+            amountOutMin,
+            path,
+            to,
+            deadline
+        );
+    }
+
+    function swapTokensV3(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        address to,
+        uint256 deadline
+    ) external {
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        IERC20(tokenIn).approve(address(uniswapV3Router), amountIn);
+
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter
+            .ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: tokenOut,
+                fee: fee,
+                recipient: to,
+                deadline: deadline,
+                amountIn: amountIn,
+                amountOutMinimum: amountOutMin,
+                sqrtPriceLimitX96: 0
+            });
+
+        uniswapV3Router.exactInputSingle(params);
     }
 }
